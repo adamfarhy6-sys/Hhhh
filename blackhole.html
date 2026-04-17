@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Event Horizon — a single-file WebGL black hole</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:ui-monospace,Menlo,Consolas,monospace;color:#cfd;}
+  canvas{display:block;width:100vw;height:100vh;cursor:crosshair;}
+  #hud{position:fixed;left:14px;bottom:12px;font-size:12px;opacity:.75;pointer-events:none;text-shadow:0 0 6px #000;}
+  #hud b{color:#9df;font-weight:600;}
+  #err{position:fixed;inset:0;display:none;place-items:center;background:#200;color:#fbb;padding:20px;white-space:pre-wrap;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><b>Event Horizon</b> — drag: orbit · wheel: zoom · <i>space</i>: pause · <i>r</i>: reset</div>
+<div id="err"></div>
+
+<script id="vs" type="x-shader/x-vertex">
+attribute vec2 p; void main(){ gl_Position = vec4(p,0.,1.); }
+</script>
+
+<script id="fs" type="x-shader/x-fragment">
+// Raymarched Schwarzschild-ish black hole with a procedural galaxy background.
+// Approximated gravitational lensing in screen-space; fast enough for real-time.
+// (c) 2026 — MIT.
+precision highp float;
+uniform vec2 uRes;
+uniform float uTime;
+uniform vec3 uCam;      // camera position
+uniform vec3 uTarget;   // look-at
+uniform float uSpin;    // disk rotation phase
+
+#define PI 3.14159265359
+
+// --- hash / noise -----------------------------------------------------------
+float hash(vec3 p){ p = fract(p*0.3183099+vec3(.71,.113,.419));
+  p *= 17.; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
+float noise(vec3 x){
+  vec3 i = floor(x), f = fract(x);
+  f = f*f*(3.-2.*f);
+  return mix(mix(mix(hash(i+vec3(0,0,0)),hash(i+vec3(1,0,0)),f.x),
+                 mix(hash(i+vec3(0,1,0)),hash(i+vec3(1,1,0)),f.x),f.y),
+             mix(mix(hash(i+vec3(0,0,1)),hash(i+vec3(1,0,1)),f.x),
+                 mix(hash(i+vec3(0,1,1)),hash(i+vec3(1,1,1)),f.x),f.y), f.z);
+}
+float fbm(vec3 p){
+  float v=0., a=0.5;
+  for(int i=0;i<5;i++){ v += a*noise(p); p*=2.02; a*=0.5; }
+  return v;
+}
+
+// --- starfield on a direction ----------------------------------------------
+vec3 stars(vec3 dir){
+  // quantize direction into cells; each cell may host a star.
+  vec3 s = vec3(0.);
+  vec3 d = normalize(dir);
+  for(int k=0;k<3;k++){
+    float scale = 180. + float(k)*260.;
+    vec3 g = d*scale;
+    vec3 i = floor(g), f = fract(g);
+    float h = hash(i+float(k)*7.1);
+    if(h>0.985){
+      vec3 c = vec3(0.5)+0.5*vec3(hash(i+1.),hash(i+2.),hash(i+3.));
+      float r = length(f-0.5);
+      float b = smoothstep(0.5,0.0,r);
+      s += c * pow(b, 6.0) * (2.0 + 6.0*(h-0.985)/0.015);
+    }
+  }
+  // dim galactic band
+  float band = exp(-pow(dir.y*2.3,2.0));
+  vec3 neb = vec3(0.25,0.35,0.7)*fbm(d*3.0+vec3(0,0,uTime*0.01))
+           + vec3(0.7,0.25,0.45)*fbm(d*5.0+11.0);
+  s += neb*band*0.25;
+  return s;
+}
+
+// --- accretion disk ---------------------------------------------------------
+// intersect ray with disk plane y=0, inner radius ri, outer ro
+bool diskHit(vec3 ro, vec3 rd, float ri, float ro_, out float t, out vec3 hit){
+  if(abs(rd.y)<1e-4) return false;
+  t = -ro.y/rd.y;
+  if(t<=0.) return false;
+  hit = ro + rd*t;
+  float r = length(hit.xz);
+  return r>ri && r<ro_;
+}
+vec3 diskColor(vec3 hit){
+  float r = length(hit.xz);
+  float ang = atan(hit.z, hit.x);
+  // differential rotation (inner spins faster)
+  float rot = uSpin*1.6/pow(r,1.3);
+  vec3 q = vec3(cos(ang+rot), 0., sin(ang+rot))*r;
+  float n = fbm(q*0.9 + vec3(0,uTime*0.15,0));
+  float density = smoothstep(0.0,1.0,n)*smoothstep(5.2,1.4,r)*smoothstep(1.05,1.25,r);
+  // temperature gradient: hot (blue-white) near, cool (orange) far
+  float t = clamp(1.2/r, 0., 1.);
+  vec3 hotC  = vec3(1.3,1.45,1.8);
+  vec3 midC  = vec3(1.6,0.9,0.45);
+  vec3 coolC = vec3(0.9,0.35,0.15);
+  vec3 col = mix(coolC, midC, smoothstep(0.15,0.5,t));
+  col = mix(col, hotC, smoothstep(0.55,0.95,t));
+  return col * density * (1.8 + 2.0*smoothstep(1.1,1.25,r));
+}
+
+// --- gravitational lensing (screen-space deflection) -----------------------
+// Approximate: bend the ray direction toward the BH based on impact parameter.
+vec3 lensDir(vec3 ro, vec3 rd){
+  // vector from camera to BH (origin)
+  vec3 L = -ro;
+  float tClosest = dot(L, rd);
+  vec3 closest = ro + rd*tClosest;
+  float b = length(closest);               // impact parameter
+  if(tClosest<0.) return rd;               // BH behind
+  // deflection ~ 4M/b; scale empirically for visuals
+  float rs = 1.0;                          // Schwarzschild radius (units)
+  float defl = 2.6*rs/max(b, 0.35);
+  defl = clamp(defl, 0., 1.8);
+  vec3 toBH = normalize(-closest);
+  return normalize(rd + toBH*defl);
+}
+
+void main(){
+  vec2 uv = (gl_FragCoord.xy - 0.5*uRes)/uRes.y;
+
+  // camera basis
+  vec3 ro = uCam;
+  vec3 fw = normalize(uTarget - ro);
+  vec3 rt = normalize(cross(fw, vec3(0,1,0)));
+  vec3 up = cross(rt, fw);
+  vec3 rd = normalize(fw + uv.x*rt + uv.y*up);
+
+  // photon capture: if ray points within the shadow cone of the BH, it's swallowed
+  float bImpact;
+  {
+    vec3 L = -ro;
+    float tC = dot(L, rd);
+    vec3 cl = ro + rd*tC;
+    bImpact = length(cl);
+    if(tC>0.0 && bImpact < 1.05){
+      gl_FragColor = vec4(0,0,0,1);
+      return;
+    }
+  }
+
+  // lens the ray
+  vec3 rdL = lensDir(ro, rd);
+
+  // try disk intersection with lensed ray (better): march original + lensed mix
+  vec3 col = vec3(0.);
+  float tD; vec3 hD;
+  if(diskHit(ro, rdL, 1.1, 5.2, tD, hD)){
+    vec3 dc = diskColor(hD);
+    // doppler boost: approaching side brightens, receding dims
+    float ang = atan(hD.z, hD.x);
+    vec3 vel = vec3(-sin(ang),0.,cos(ang));
+    float dop = 1.0 + 0.55*dot(vel, normalize(rd));
+    col += dc * pow(max(dop,0.05), 3.2);
+  }
+
+  // background through the lensed direction
+  vec3 bg = stars(rdL);
+  col += bg * smoothstep(0.0, 0.3, abs(rdL.y)+0.15);
+
+  // photon ring glow near shadow
+  float ring = exp(-pow((bImpact-1.15)/0.07, 2.0));
+  col += vec3(1.3,0.95,0.7)*ring*1.2;
+
+  // soft vignette + tonemap
+  col *= 1.0 - 0.25*pow(length(uv), 2.0);
+  col = col/(1.0+col);                  // Reinhard
+  col = pow(col, vec3(1.0/2.2));        // gamma
+  gl_FragColor = vec4(col, 1.0);
+}
+</script>
+
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const gl = canvas.getContext('webgl', {antialias:false, preserveDrawingBuffer:false});
+  const errEl = document.getElementById('err');
+  if(!gl){ errEl.textContent = 'WebGL not available.'; errEl.style.display='grid'; return; }
+
+  const src = id => document.getElementById(id).textContent;
+  const mkShader = (type, s) => {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, s); gl.compileShader(sh);
+    if(!gl.getShaderParameter(sh, gl.COMPILE_STATUS)){
+      errEl.textContent = gl.getShaderInfoLog(sh); errEl.style.display='grid';
+      throw new Error('shader');
+    }
+    return sh;
+  };
+  const vs = mkShader(gl.VERTEX_SHADER, src('vs'));
+  const fs = mkShader(gl.FRAGMENT_SHADER, src('fs'));
+  const prog = gl.createProgram();
+  gl.attachShader(prog, vs); gl.attachShader(prog, fs);
+  gl.bindAttribLocation(prog, 0, 'p');
+  gl.linkProgram(prog);
+  if(!gl.getProgramParameter(prog, gl.LINK_STATUS)){
+    errEl.textContent = gl.getProgramInfoLog(prog); errEl.style.display='grid'; return;
+  }
+  gl.useProgram(prog);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+  const U = name => gl.getUniformLocation(prog, name);
+  const u = { res:U('uRes'), time:U('uTime'), cam:U('uCam'), tgt:U('uTarget'), spin:U('uSpin') };
+
+  // camera state: spherical around origin
+  const state = { yaw: 0.6, pitch: 0.28, dist: 8.5, paused:false, t0: performance.now(), t: 0, spin: 0 };
+
+  function resize(){
+    const dpr = Math.min(devicePixelRatio||1, 2);
+    canvas.width  = Math.floor(innerWidth*dpr);
+    canvas.height = Math.floor(innerHeight*dpr);
+    gl.viewport(0,0,canvas.width,canvas.height);
+  }
+  addEventListener('resize', resize); resize();
+
+  // input
+  let drag=false, lx=0, ly=0;
+  canvas.addEventListener('pointerdown', e=>{drag=true;lx=e.clientX;ly=e.clientY;canvas.setPointerCapture(e.pointerId);});
+  canvas.addEventListener('pointerup',   e=>{drag=false;});
+  canvas.addEventListener('pointermove', e=>{
+    if(!drag) return;
+    state.yaw   += (e.clientX-lx)*0.005;
+    state.pitch += (e.clientY-ly)*0.005;
+    state.pitch = Math.max(-1.3, Math.min(1.3, state.pitch));
+    lx=e.clientX; ly=e.clientY;
+  });
+  canvas.addEventListener('wheel', e=>{
+    state.dist *= Math.exp(e.deltaY*0.0015);
+    state.dist = Math.max(3.0, Math.min(30, state.dist));
+    e.preventDefault();
+  }, {passive:false});
+  addEventListener('keydown', e=>{
+    if(e.code==='Space'){ state.paused=!state.paused; e.preventDefault(); }
+    if(e.key==='r'){ state.yaw=0.6; state.pitch=0.28; state.dist=8.5; }
+  });
+
+  function frame(now){
+    if(!state.paused){
+      const dt = (now - state.t0)/1000;
+      state.t0 = now;
+      state.t += dt;
+      state.spin += dt;
+    } else { state.t0 = now; }
+    const cy = Math.cos(state.yaw), sy = Math.sin(state.yaw);
+    const cp = Math.cos(state.pitch), sp = Math.sin(state.pitch);
+    const cam = [ state.dist*cp*sy, state.dist*sp, state.dist*cp*cy ];
+
+    gl.uniform2f(u.res, canvas.width, canvas.height);
+    gl.uniform1f(u.time, state.t);
+    gl.uniform3fv(u.cam, cam);
+    gl.uniform3fv(u.tgt, [0,0,0]);
+    gl.uniform1f(u.spin, state.spin);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
