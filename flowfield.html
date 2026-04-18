@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Flow Field — 20k particles in a living vector field</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden;cursor:crosshair;font:12px ui-monospace,Menlo,Consolas,monospace;color:#9cf;}
+  canvas{display:block;width:100vw;height:100vh;}
+  #hud{position:fixed;left:12px;bottom:10px;opacity:.7;text-shadow:0 0 6px #000;pointer-events:none;}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><b>Flow Field</b> — move mouse to push · click to burst · <i>space</i>: wipe</div>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W,H,dpr; const N = 20000;
+const P = new Float32Array(N*4); // x,y,vx,vy
+const hue = new Float32Array(N);
+
+function resize(){
+  dpr = Math.min(devicePixelRatio||1, 2);
+  cv.width = innerWidth*dpr; cv.height = innerHeight*dpr;
+  W = cv.width; H = cv.height;
+  ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H);
+}
+addEventListener('resize', resize); resize();
+
+for(let i=0;i<N;i++){
+  P[i*4]   = Math.random()*W;
+  P[i*4+1] = Math.random()*H;
+  P[i*4+2] = 0; P[i*4+3] = 0;
+  hue[i] = Math.random()*360;
+}
+
+let mx=W/2, my=H/2, mdown=false, t=0;
+addEventListener('mousemove', e=>{ mx=e.clientX*dpr; my=e.clientY*dpr; });
+addEventListener('mousedown', ()=>mdown=true);
+addEventListener('mouseup',   ()=>mdown=false);
+addEventListener('keydown', e=>{ if(e.code==='Space'){ ctx.fillStyle='#000'; ctx.fillRect(0,0,W,H); }});
+
+// cheap 2D value noise via hashed grid
+function hash(x,y){ const s = Math.sin(x*127.1+y*311.7)*43758.5453; return s-Math.floor(s); }
+function noise(x,y){
+  const xi=Math.floor(x), yi=Math.floor(y);
+  const xf=x-xi, yf=y-yi;
+  const u=xf*xf*(3-2*xf), v=yf*yf*(3-2*yf);
+  const a=hash(xi,yi), b=hash(xi+1,yi), c=hash(xi,yi+1), d=hash(xi+1,yi+1);
+  return (a*(1-u)+b*u)*(1-v) + (c*(1-u)+d*u)*v;
+}
+
+function frame(){
+  t += 0.004;
+  // fade trails
+  ctx.fillStyle = 'rgba(5,6,10,0.08)';
+  ctx.fillRect(0,0,W,H);
+
+  const scale = 0.0022;
+  for(let i=0;i<N;i++){
+    const k = i*4;
+    let x = P[k], y = P[k+1];
+    const ang = noise(x*scale, y*scale + t)*Math.PI*4;
+    let vx = P[k+2] + Math.cos(ang)*0.35;
+    let vy = P[k+3] + Math.sin(ang)*0.35;
+
+    // mouse attraction / repulsion
+    const dx = x-mx, dy = y-my, d2 = dx*dx+dy*dy+1;
+    const f = (mdown? -1 : 1) * 1800 / d2;
+    vx += dx*f*0.0008; vy += dy*f*0.0008;
+
+    vx *= 0.93; vy *= 0.93;
+    x += vx; y += vy;
+
+    if(x<0) x+=W; else if(x>=W) x-=W;
+    if(y<0) y+=H; else if(y>=H) y-=H;
+
+    P[k]=x; P[k+1]=y; P[k+2]=vx; P[k+3]=vy;
+
+    const speed = Math.sqrt(vx*vx+vy*vy);
+    const h = (hue[i] + speed*8 + t*40) % 360;
+    ctx.fillStyle = `hsla(${h},90%,${50+speed*6}%,0.55)`;
+    ctx.fillRect(x, y, 1.2*dpr, 1.2*dpr);
+  }
+  requestAnimationFrame(frame);
+}
+frame();
+</script>
+</body>
+</html>
